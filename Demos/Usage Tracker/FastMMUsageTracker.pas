@@ -69,9 +69,6 @@ type
 
   TfFastMMUsageTracker = class(TForm)
     tTimer: TTimer;
-    bClose: TBitBtn;
-    bUpdate: TBitBtn;
-    ChkAutoUpdate: TCheckBox;
     smVMDump: TPopupMenu;
     smMM4Allocation: TPopupMenu;
     smGeneralInformation: TPopupMenu;
@@ -85,15 +82,66 @@ type
     tsGeneralInformation: TTabSheet;
     mVMStatistics: TMemo;
     sgVMDump: TStringGrid;
-    Label1: TLabel;
-    Label2: TLabel;
-    Label3: TLabel;
-    eAddress: TEdit;
-    eState: TEdit;
-    eDLLName: TEdit;
-    ChkSmallGraph: TCheckBox;
     sgBlockStatistics: TStringGrid;
     dgMemoryMap: TDrawGrid;
+    Panel1: TPanel;
+    ChkAutoUpdate: TCheckBox;
+    bUpdate: TBitBtn;
+    bClose: TBitBtn;
+    Panel2: TPanel;
+    Label3: TLabel;
+    eDLLName: TEdit;
+    Label1: TLabel;
+    eAddress: TEdit;
+    Label2: TLabel;
+    eState: TEdit;
+    ChkSmallGraph: TCheckBox;
+    tsFileState: TTabSheet;
+    mFileState: TMemo;
+    ChkFastUpdate: TCheckBox;
+    tsDelta: TTabSheet;
+    mDelta: TMemo;
+    gpDeltaTop: TGridPanel;
+    pDeltaTop: TPanel;
+    Panel4: TPanel;
+    bDeltaUpdateBase: TButton;
+    bDeltaUpdateComparator: TButton;
+    lDeltaBase: TLabel;
+    lDeltaComparator: TLabel;
+    tsDeltaInstances: TTabSheet;
+    gbDeltaClasses: TGroupBox;
+    Panel3: TPanel;
+    gbDeltaInstances: TGroupBox;
+    GroupBox3: TGroupBox;
+    mDeltaInstanceStackTrace: TMemo;
+    lbDeltaClasses: TListBox;
+    lbDeltaClassInstances: TListBox;
+    Splitter1: TSplitter;
+    FlowPanel1: TFlowPanel;
+    cbDeltaInstancesUsemadExcept: TCheckBox;
+    cbDeltaInstancesmadHideUgly: TCheckBox;
+    cbDeltaInstancesmadRelAddr: TCheckBox;
+    cbDeltaInstancesmadRelLines: TCheckBox;
+    cbDeltaInstancesmadDumbTrace: TCheckBox;
+    Panel5: TPanel;
+    Label4: TLabel;
+    cbDeltaInstancesSortMode: TComboBox;
+    TabSheet1: TTabSheet;
+    GroupBox1: TGroupBox;
+    Panel6: TPanel;
+    GroupBox2: TGroupBox;
+    Panel7: TPanel;
+    GroupBox4: TGroupBox;
+    mCustomCallbackMadExcept: TMemo;
+    FlowPanel2: TFlowPanel;
+    cbCCmadHideUgly: TCheckBox;
+    cbCCmadShowRelAddr: TCheckBox;
+    cbCCmadShowRelLines: TCheckBox;
+    cbCCmadDumbTrace: TCheckBox;
+    Splitter2: TSplitter;
+    mCustomCallbackSource: TMemo;
+    mCustomCallbackFastMM: TMemo;
+    Splitter3: TSplitter;
     procedure FormClose(Sender: TObject; var Action: TCloseAction);
     procedure tTimerTimer(Sender: TObject);
     procedure FormCreate(Sender: TObject);
@@ -116,26 +164,67 @@ type
     procedure siMM4AllocationCopyAlltoClipboardClick(Sender: TObject);
     procedure sgBlockStatisticsDrawCell(Sender: TObject; ACol,
       ARow: Integer; Rect: TRect; State: TGridDrawState);
+    procedure FormResize(Sender: TObject);
+    procedure ChkFastUpdateClick(Sender: TObject);
+    procedure bDeltaUpdateBaseClick(Sender: TObject);
+    procedure bDeltaUpdateComparatorClick(Sender: TObject);
+    procedure lbDeltaClassesClick(Sender: TObject);
+    procedure lbDeltaClassInstancesClick(Sender: TObject);
+    procedure mDeltaInstanceStackTraceClick(Sender: TObject);
+    procedure cbDeltaInstancesUsemadExceptClick(Sender: TObject);
+    procedure cbDeltaInstancesmadHideUglyClick(Sender: TObject);
+    procedure cbDeltaInstancesmadRelAddrClick(Sender: TObject);
+    procedure cbDeltaInstancesmadRelLinesClick(Sender: TObject);
+    procedure cbDeltaInstancesmadDumbTraceClick(Sender: TObject);
+    procedure cbDeltaInstancesSortModeChange(Sender: TObject);
+    procedure FlowPanel1Resize(Sender: TObject);
+    procedure mCustomCallbackSourceKeyPress(Sender: TObject; var Key: Char);
+    procedure mCustomCallbackSourceChange(Sender: TObject);
   private
+
     {The current and previous memory manager states}
     FMemoryManagerState, FPrevMemoryManagerState: TMemoryManagerState;
     FMemoryMapEx: TMemoryMapEx;
     AddressSpacePageCount: Integer;
     OR_VMDumpDownCell: TGridCoord;
+    FDeltaBaseState:    PMemoryManagerObjectState;
+    FDeltaCompareState: PMemoryManagerObjectState;
+    FDeltaState:        PMemoryManagerObjectDelta;
+    FClassInstances:    PClassInstanceData;
+    FCCSourceChangeCycle: Boolean;
     procedure HeaderClicked(AGrid: TStringgrid; const ACell: TGridCoord);
     procedure SortGrid(grid: TStringgrid; PB_Nummeric: Boolean; byColumn: Integer; ascending: Boolean);
     procedure UpdateGraphMetrics;
+    procedure UpdateFileState;
+    procedure UpdateDeltaState;
+
+    procedure UpdateDeltaBase;
+    procedure UpdateDeltaComparator;
+    procedure RefreshDeltaView;
+    procedure UpdateDeltaInstanceView();
+    function ClassName( AClassPtr: Pointer ): String;
+
+    procedure OpenIDEFileAtLine( const AUnitFile: String; const ALineNumer: Integer );
   public
     {Refreshes the display}
     procedure RefreshSnapShot;
+    procedure EnableTimer(const AEnabled: Boolean);
   end;
 
-function ShowFastMMUsageTracker: TfFastMMUsageTracker;
+  function ShowFastMMUsageTracker: TfFastMMUsageTracker;
+  function CreateFastMMUsageTracker: TfFastMMUsageTracker;
 
 implementation
 
 uses
-  Clipbrd, PsAPI;
+  System.Math,
+  Clipbrd,
+  PsAPI,
+  madStackTrace,
+  System.IOUtils,
+  System.RegularExpressions,
+  System.UITypes, System.Generics.Collections;
+  //,ToolsAPI;
 
 {$R *.dfm}
 
@@ -215,6 +304,19 @@ begin
     Result.Show;
   end;
 end;
+
+function CreateFastMMUsageTracker: TfFastMMUsageTracker;
+begin
+  Application.CreateForm(TfFastMMUsageTracker, Result);
+  if Assigned(Result) then
+  begin
+    Result.BorderIcons := [];
+    Result.BorderStyle := bsNone;
+    Result.bClose.Enabled := False;
+    Result.RefreshSnapShot;
+  end;
+end;
+
 
 function CardinalToStringFormatted(const ACardinal: Cardinal): string;
 begin
@@ -308,8 +410,20 @@ begin
   end;
 end;
 
+procedure TfFastMMUsageTracker.FormResize(Sender: TObject);
+begin
+  UpdateGraphMetrics();
+end;
+
+
+procedure TfFastMMUsageTracker.FlowPanel1Resize(Sender: TObject);
+begin
+  FlowPanel1.Realign();
+end;
+
 procedure TfFastMMUsageTracker.FormClose(Sender: TObject; var Action: TCloseAction);
 begin
+  tTimer.Enabled := False;
   Action := caFree;
 end;
 
@@ -468,20 +582,188 @@ begin
   TLocalStringGrid(AGrid).InvalidateCell(ACell.x, ACell.y);
 end;
 
+procedure TfFastMMUsageTracker.lbDeltaClassesClick(Sender: TObject);
+var
+  LIdx: NativeInt;
+  LInfo: TBlockInfo;
+  LSortOp: TSortOperation;
+begin
+  if (FDeltaState = nil) then Exit;  
+
+  //find all instances here
+  if not InRange( lbDeltaClasses.ItemIndex, 0, FDeltaState.NodeCount-1 ) then
+    Exit;
+
+  //show warning for too much entries of types "unknown" and "string types"
+  if (NativeUInt(FDeltaState.Nodes[ lbDeltaClasses.ItemIndex ].ClassPtr) <= NativeUInt(3) ) and
+     (FDeltaState.Nodes[ lbDeltaClasses.ItemIndex ].InstanceCount > 1000) then
+    if (mrOk <> MessageDlg('Fetching all instances of this Type may take a few minutes.' + sLineBreak + 'Are you sure?', TMsgDlgType.mtWarning, mbOKCancel, 0 )) then
+      Exit;
+
+  //get sort mode
+  LSortOp := TSortOperation( EnsureRange(cbDeltaInstancesSortMode.ItemIndex, Ord(Low(TSortOperation)), Ord(High(TSortOperation))) );
+
+  if Assigned(FClassInstances) then FreeClassInstances( FClassInstances );
+  FClassInstances := GetClassInstances( FDeltaState.Nodes[ lbDeltaClasses.ItemIndex ].ClassPtr, FDeltaState.AllocNumberLeft, LSortOp );
+
+  lbDeltaClassInstances.Items.BeginUpdate();
+  lbDeltaClassInstances.Items.Clear();
+
+  if (FClassInstances.InstanceCount > 0) then
+    for LIdx := 0 to FClassInstances.InstanceCount-1 do
+    begin
+      LInfo := GetInfoFromBlock( FClassInstances.Instances[ LIdx ] );
+      lbDeltaClassInstances.Items.Add( Format( '%9d ($%8x) (%d Bytes) (Thread: %d)',
+                                                [ LInfo.AllocationNumber,
+                                                  NativeUInt(FClassInstances.Instances[ LIdx ]),
+                                                  LInfo.UserSize,
+                                                  LInfo.AllocatedByThread] ));
+    end;
+
+  lbDeltaClassInstances.Items.EndUpdate();
+
+  gbDeltaInstances.Caption := 'Instances (' + IntToStr(FClassInstances.InstanceCount) + ')';
+end;
+
+procedure TfFastMMUsageTracker.lbDeltaClassInstancesClick(Sender: TObject);
+var
+  LBuffer: array[0..16383] of AnsiChar;
+  LBufferPtr: PAnsiChar;
+  LStackTracePtr: Pointer;
+  LStackTraceDepth: Integer;
+begin
+  //create stack trace here - if possible
+  //find all instances here
+  if not InRange( lbDeltaClassInstances.ItemIndex, 0, FClassInstances.InstanceCount-1 ) then
+    Exit;
+
+  mDeltaInstanceStackTrace.Text := GetStackTraceStringFromBlock( FClassInstances.Instances[lbDeltaClassInstances.ItemIndex] );
+
+  //do we prefer the madExcept interpretation of the stacktrace?
+  if not cbDeltaInstancesUsemadExcept.Checked then
+    Exit;
+
+  //try to parse the stacktrace via madExcept.. they look WAAAAYY better
+  GetStackTraceFromBlock( FClassInstances.Instances[lbDeltaClassInstances.ItemIndex], LStackTracePtr, LStackTraceDepth );
+
+  if (LStackTraceDepth <> 0) then
+  begin
+    LBufferPtr := @LBuffer[0];
+    LBufferPtr := FastMM_LogStackTrace( LStackTracePtr, LStackTraceDepth, LBufferPtr,
+                                        cbDeltaInstancesmadHideUgly.Checked,
+                                        cbDeltaInstancesmadRelAddr.Checked,
+                                        cbDeltaInstancesmadRelLines.Checked,
+                                        cbDeltaInstancesmadDumbTrace.Checked);
+    mDeltaInstanceStackTrace.Text := String( Copy( LBuffer, 0, (LBufferPtr-@LBuffer[0])) );
+  end;
+end;
+
+procedure TfFastMMUsageTracker.UpdateDeltaBase;
+begin
+  if Assigned( FDeltaBaseState ) then
+    FreeMemoryManagerObjectState( FDeltaBaseState );
+
+  FDeltaBaseState     := GetMemoryManagerObjectState();
+  lDeltaBase.Caption  := DateTimeToStr( Now() );
+
+  RefreshDeltaView();
+end;
+
+procedure TfFastMMUsageTracker.UpdateDeltaComparator;
+begin
+  if Assigned( FDeltaCompareState ) then
+    FreeMemoryManagerObjectState( FDeltaCompareState );
+
+  FDeltaCompareState        := GetMemoryManagerObjectState();
+  lDeltaComparator.Caption  := DateTimeToStr( Now() );
+
+  RefreshDeltaView();
+  UpdateDeltaInstanceView();
+end;
+
+procedure TfFastMMUsageTracker.UpdateDeltaInstanceView;
+var
+  LNodeIdx: Integer;
+begin
+  if not Assigned(FDeltaState) then Exit;
+
+  //update list box by adding all available class types
+  lbDeltaClasses.Items.BeginUpdate();
+  lbDeltaClasses.Items.Clear();
+
+  //list all class entries
+  for LNodeIdx := 0 to FDeltaState.NodeCount-1 do
+    lbDeltaClasses.Items.Add( Format('%4d(%4d) %s', [ FDeltaState.Nodes[LNodeIdx].InstanceDelta,
+                                                      FDeltaState.Nodes[LNodeIdx].InstanceCount,
+                                                      ClassName(FDeltaState.Nodes[LNodeIdx].ClassPtr)] ) );
+  lbDeltaClasses.Items.EndUpdate();
+  gbDeltaClasses.Caption := 'Classes (' + IntToStr( FDeltaState.NodeCount ) + ')';
+end;
+
+procedure TfFastMMUsageTracker.UpdateDeltaState;
+begin
+  if not Assigned(FDeltaBaseState) then
+    UpdateDeltaBase()
+  else
+    UpdateDeltaComparator();
+end;
+
+procedure TfFastMMUsageTracker.UpdateFileState;
+var
+  LTempFile: String;
+  LLinePos:  Integer;
+begin
+  LTempFile := TPath.GetTempFileName;
+  LogMemoryManagerStateToFile( LTempFile );
+  LLinePos := mFileState.Perform(EM_GETFIRSTVISIBLELINE, 0, 0);
+  mFileState.Lines.Clear;
+  mFileState.Lines.LoadFromFile( LTempFile );
+  TFile.Delete( LTempFile );
+  mFileState.ScrollBars := ssVertical;
+  mFileState.Perform(EM_LINESCROLL, 0, LLinePos);
+end;
+
 procedure TfFastMMUsageTracker.UpdateGraphMetrics;
 begin
   if ChkSmallGraph.Checked then
   begin
     dgMemoryMap.DefaultColWidth := 4;
-    dgMemoryMap.ColCount := 128;
+    dgMemoryMap.ColCount := (dgMemoryMap.Width div dgMemoryMap.DefaultColWidth)-4;//128;
   end
   else
   begin
     dgMemoryMap.DefaultColWidth := 8;
-    dgMemoryMap.ColCount := 64;
+    dgMemoryMap.ColCount := (dgMemoryMap.Width div dgMemoryMap.DefaultColWidth)-2;//64
   end;
   dgMemoryMap.DefaultRowHeight := dgMemoryMap.DefaultColWidth;
   dgMemoryMap.RowCount := AddressSpacePageCount div dgMemoryMap.ColCount;
+end;
+
+procedure TfFastMMUsageTracker.RefreshDeltaView;
+var
+  LTempFile: String;
+  LLinePos:  Integer;
+begin
+  if Assigned(FDeltaBaseState) and Assigned(FDeltaCompareState) then
+  begin
+    //calc delta
+    if Assigned(FDeltaState) then
+      FreeStateDeltaMemory(FDeltaState);
+
+    FDeltaState := CalculateStateDelta( FDeltaBaseState, FDeltaCompareState );
+
+    //write delta to file
+    LTempFile := TPath.GetTempFileName;
+    LogMemoryManagerStateDeltaToFile( LTempFile, FDeltaState );
+    //visualize delta
+    LLinePos := mDelta.Perform(EM_GETFIRSTVISIBLELINE, 0, 0);
+    mDelta.Lines.Clear;
+    mDelta.Lines.LoadFromFile( LTempFile );
+    mDelta.Perform(EM_LINESCROLL, 0, LLinePos);
+
+    //clean up
+    TFile.Delete( LTempFile );
+  end;
 end;
 
 procedure TfFastMMUsageTracker.RefreshSnapShot;
@@ -696,6 +978,20 @@ var
   end;
 
   procedure UpdateStatisticsData;
+
+    function LocSort(P1, P2: Pointer): Integer;
+    begin
+      if Cardinal(P1) = Cardinal(P2) then
+        Result := 0
+      else
+      begin
+        if Cardinal(P1) > Cardinal(P2) then
+          Result := -1
+        else
+          Result := 1;
+      end;
+    end;
+
   const
     CI_MaxFreeBlocksList = 9;
 
@@ -709,7 +1005,10 @@ var
     LU_MaxQuota: {$if CompilerVersion >= 23}NativeUInt{$else}Cardinal{$ifend};
     LI_I: Integer;
     LI_Max: Integer;
+    LI_ScrollPos: Integer;
   begin
+    LI_ScrollPos := mVMStatistics.Perform(EM_GETFIRSTVISIBLELINE, 0, 0);
+
     mVMStatistics.Lines.BeginUpdate;
     try
       mVMStatistics.Clear;
@@ -804,8 +1103,8 @@ var
             Add('Working Set Size                  = ' + Int64ToKStringFormatted(WorkingSetSize));
             Add('Quota Peak Paged Pool Usage       = ' + Int64ToKStringFormatted(QuotaPeakPagedPoolUsage));
             Add('Quota Paged Pool Usage            = ' + Int64ToKStringFormatted(QuotaPagedPoolUsage));
-            Add('Quota Peak Non-Paged Pool Usage  = ' + Int64ToKStringFormatted(QuotaPeakNonPagedPoolUsage));
-            Add('Quota Non-Paged Pool Usage       = ' + Int64ToKStringFormatted(QuotaNonPagedPoolUsage));
+            Add('Quota Peak Non-Paged Pool Usage   = ' + Int64ToKStringFormatted(QuotaPeakNonPagedPoolUsage));
+            Add('Quota Non-Paged Pool Usage        = ' + Int64ToKStringFormatted(QuotaNonPagedPoolUsage));
             Add('Pagefile Usage                    = ' + Int64ToKStringFormatted(PagefileUsage));
             Add('Peak Pagefile Usage               = ' + Int64ToKStringFormatted(PeakPagefileUsage));
           end;
@@ -849,6 +1148,7 @@ var
 
     finally
       mVMStatistics.Lines.EndUpdate;
+      mVMStatistics.Perform(EM_LINESCROLL, 0, LI_ScrollPos);
     end;
   end;
 
@@ -894,6 +1194,18 @@ begin
 
     // General Information
     UpdateStatisticsData;
+
+    // LogMemoryManagerStateToFile Update
+    // - only use this, when the tab is active
+    // - function is too slow for always enabled background auto update
+    if (pcUsageTracker.ActivePage = tsFileState) then
+      UpdateFileState;
+
+    // LogMemoryManagerStateToFile Update
+    // - only use this, when the tab is active
+    // - function is too slow for always enabled background auto update
+    if (pcUsageTracker.ActivePage = tsDelta) or (pcUsageTracker.ActivePage = tsDeltaInstances) then
+      UpdateDeltaState();
 
     // Screen updates
     dgMemoryMap.Invalidate;
@@ -1065,9 +1377,61 @@ begin
   end;
 end;
 
+procedure TfFastMMUsageTracker.EnableTimer(const AEnabled: Boolean);
+begin
+  ChkAutoUpdate.Checked := AEnabled;
+  tTimer.Enabled := AEnabled;
+end;
+
+procedure TfFastMMUsageTracker.bDeltaUpdateBaseClick(Sender: TObject);
+begin
+  UpdateDeltaBase();
+end;
+
+procedure TfFastMMUsageTracker.bDeltaUpdateComparatorClick(
+  Sender: TObject);
+begin
+  UpdateDeltaComparator();
+end;
+
 procedure TfFastMMUsageTracker.bUpdateClick(Sender: TObject);
 begin
   RefreshSnapShot;
+end;
+
+procedure TfFastMMUsageTracker.cbDeltaInstancesmadDumbTraceClick(Sender: TObject);
+begin
+  //react on changed "show stack trace" settings click
+  lbDeltaClassInstancesClick(nil);
+end;
+
+procedure TfFastMMUsageTracker.cbDeltaInstancesmadHideUglyClick(Sender: TObject);
+begin
+  //react on changed "show stack trace" settings click
+  lbDeltaClassInstancesClick(nil);
+end;
+
+procedure TfFastMMUsageTracker.cbDeltaInstancesmadRelAddrClick(Sender: TObject);
+begin
+  //react on changed "show stack trace" settings click
+  lbDeltaClassInstancesClick(nil);
+end;
+
+procedure TfFastMMUsageTracker.cbDeltaInstancesmadRelLinesClick(Sender: TObject);
+begin
+  //react on changed "show stack trace" settings click
+  lbDeltaClassInstancesClick(nil);
+end;
+
+procedure TfFastMMUsageTracker.cbDeltaInstancesUsemadExceptClick(Sender: TObject);
+begin
+  cbDeltaInstancesmadHideUgly.Enabled := cbDeltaInstancesUsemadExcept.Checked;
+  cbDeltaInstancesmadRelAddr.Enabled := cbDeltaInstancesUsemadExcept.Checked;
+  cbDeltaInstancesmadRelLines.Enabled := cbDeltaInstancesUsemadExcept.Checked;
+  cbDeltaInstancesmadDumbTrace.Enabled := cbDeltaInstancesUsemadExcept.Checked;
+
+  //react on switched exception click
+  lbDeltaClassInstancesClick(nil);
 end;
 
 procedure TfFastMMUsageTracker.ChkAutoUpdateClick(Sender: TObject);
@@ -1075,11 +1439,55 @@ begin
   tTimer.Enabled := ChkAutoUpdate.Checked;
 end;
 
+procedure TfFastMMUsageTracker.ChkFastUpdateClick(Sender: TObject);
+begin
+  if (ChkFastUpdate.Checked) then
+    tTimer.Interval := 200
+  else
+    tTimer.Interval := 2000;
+end;
+
 procedure TfFastMMUsageTracker.ChkSmallGraphClick(Sender: TObject);
 begin
   UpdateGraphMetrics;
   dgMemoryMap.Invalidate;
   dgMemoryMap.SetFocus;
+end;
+
+function TfFastMMUsageTracker.ClassName(AClassPtr: Pointer): String;
+var
+  LShort: PShortString;
+begin
+  case NativeInt(AClassPtr) of
+    {Unknown}
+    0:
+    begin
+      Result := 'Unknown';
+    end;
+    {AnsiString}
+    1:
+    begin
+      Result := 'AnsicodeString';
+    end;
+    {UnicodeString}
+    2:
+    begin
+      Result := 'UnicodeString';
+    end;
+    {Classes}
+  else
+    begin
+      LShort := PShortString(PPointer(PByte(AClassPtr) + vmtClassName)^);
+      Result := String( LShort^ );
+    end;
+  end;
+
+end;
+
+procedure TfFastMMUsageTracker.cbDeltaInstancesSortModeChange(Sender: TObject);
+begin
+  //reselect instance type
+  lbDeltaClassesClick(nil);
 end;
 
 procedure TfFastMMUsageTracker.sgVMDumpMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
@@ -1151,6 +1559,140 @@ procedure TfFastMMUsageTracker.miVMDumpCopyAlltoClipboardClick(Sender: TObject);
 begin
   CopyGridContentsToClipBoard(sgVMDump);
 end;
+
+procedure TfFastMMUsageTracker.mCustomCallbackSourceChange(Sender: TObject);
+var
+  LLineIdx:   Integer;
+  LHexLength: Integer;
+  LValue:     Int64;
+  LLine:      String;
+  LPointers:  TList<NativeUInt>;
+  LBuffer: array[0..16383] of AnsiChar;
+  LBufferPtr: PAnsiChar;
+  LPrepStack: Pointer;
+begin
+  if FCCSourceChangeCycle then Exit;
+  
+  LPointers := TList<NativeUInt>.Create();
+  LPointers.Capacity := 32;
+  LLineIdx    := 0;
+  //8 for 32, 16 for 64
+  LHexLength  := SizeOf(NativeUInt)*2;
+
+  FCCSourceChangeCycle := True; //avoid cyclic stack overflow
+  mCustomCallbackSource.Lines.BeginUpdate();
+  while (LLineIdx < mCustomCallbackSource.Lines.Count) do
+  begin
+    //line too long?
+    if (mCustomCallbackSource.Lines[LLineIdx].Length > LHexLength) then
+    begin
+      LLine := mCustomCallbackSource.Lines[LLineIdx];
+      mCustomCallbackSource.Lines[LLineIdx] := LLine.Substring(0, LHexLength);
+      mCustomCallbackSource.Lines.Insert(LLineIdx, LLine.Substring(LHexLength));
+    end;
+
+    //parse to pointer
+    if TryStrToInt64('$'+mCustomCallbackSource.Lines[LLineIdx], LValue) then
+      LPointers.Add( NAtiveUInt(LValue) );
+
+    Inc(LLineIdx);
+  end;
+  mCustomCallbackSource.Lines.EndUpdate();
+  FCCSourceChangeCycle := False;
+
+  //parse stack
+  mCustomCallbackFastMM.Text := GetStackTraceStringFromMemory( LPointers.List, LPointers.Count );
+
+  LBufferPtr := @LBuffer[0];
+  FillChar(LBuffer, length(LBuffer), 0);
+  LPrepStack := @(LPointers.List[0]);
+  LBufferPtr := FastMM_LogStackTrace( LPrepStack, LPointers.Count, LBufferPtr,
+                                      cbCCmadHideUgly.Checked,
+                                      cbCCmadShowRelAddr.Checked,
+                                      cbCCmadShowRelLines.Checked,
+                                      cbCCmadDumbTrace.Checked);
+  mCustomCallbackMadExcept.Text := String( Copy( LBuffer, 0, (LBufferPtr-@LBuffer[0])) );
+  LPointers.Free;
+end;
+
+procedure TfFastMMUsageTracker.mCustomCallbackSourceKeyPress(Sender: TObject; var Key: Char);
+const
+  CHexKeys: set of Char = ['0'..'9','a','b','c','d','e','f'];
+var
+  LOldKey: Char;
+  LSelection: TGridRect;
+begin
+  if not ( Key in CHexKeys ) and not (Key = Char(vkBack)) and not (Key = Char(vkReturn)) then
+    Key := #0;
+end;
+
+procedure TfFastMMUsageTracker.mDeltaInstanceStackTraceClick(Sender: TObject);
+const
+  konRegExp = '^[^\[\]]*\[([^\]]*)\].*\[([^\]]*)\][^\[\]]*$';
+var
+  LLine: Integer;
+  LString: String;
+  LRegEx: TRegEx;
+  lMatches: TMatchCollection;
+  LMatch: TMatch;
+  LUnit: String;
+begin
+  LLine := SendMessage(mDeltaInstanceStackTrace.Handle, EM_LINEFROMCHAR, mDeltaInstanceStackTrace.Selstart, 0);
+
+  if InRange(LLine, 0, mDeltaInstanceStackTrace.Lines.Count-1) then
+    LString := mDeltaInstanceStackTrace.Lines[LLine];
+
+  if (LString = '') then Exit;
+
+  //highlight the clicked line by selecting it
+//  mDeltaInstanceStackTrace.SelStart := mDeltaInstanceStackTrace.Perform(EM_LINEINDEX, LLine, 0);
+//  mDeltaInstanceStackTrace.SelLength := Min(10, Length(mDeltaInstanceStackTrace.Lines[LLine])) ;
+//  mDeltaInstanceStackTrace.SetFocus;
+
+  try
+    //try to parse the string via regexp
+    LRegEx  :=  TRegEx.Create( konRegExp, [roSingleLine] );
+    //find all entries
+    lMatches  :=  LRegEx.Matches( LString );
+
+    //no matches? bye bye
+    if (lMatches.Count <= 0) then Exit;
+    //we want 2 matches - the first and the second
+    if (lMatches[0].Groups.Count <> 3) then Exit;
+
+    //get unit and line of code
+    LUnit := lMatches[0].Groups[1].Value;
+    LLine := StrToInt(lMatches[0].Groups[2].Value);
+
+    //open that unit at the line in the delphi IDE
+    //OpenIDEFileAtLine( LUnit, LLine );
+  except
+    //ignore
+  end;
+end;
+
+procedure TfFastMMUsageTracker.OpenIDEFileAtLine(const AUnitFile: String; const ALineNumer: Integer);
+begin
+//var
+//  ActionServices: IOTAActionServices;
+//  EditorServices: IOTAEditorServices;
+//  Buffer: IOTAEditBuffer;
+//  Position: IOTAEditPosition;
+//begin
+//  if not Supports(ActionServices, BorlandIDEServices, IOTAEditorServices, EditorServices) then
+//    Exit;
+//  if not ActionServices.OpenFile(AUnitFile) then
+//    Exit;
+//  Buffer := EditorServices.TopBuffer;
+//  if not Assigned(Buffer) then
+//    Exit;
+//  Position := Buffer.EditPosition;
+//  if not Assigned(Position) then
+//    Exit;
+//  Position.GotoLine(ALineNumer);
+//  Buffer.TopView.Paint;
+end;
+
 
 procedure TfFastMMUsageTracker.miGeneralInformationCopyAlltoClipboardClick(Sender: TObject);
 begin

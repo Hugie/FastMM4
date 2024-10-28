@@ -1442,6 +1442,98 @@ procedure WalkAllocatedBlocks(ACallBack: TWalkAllocatedBlocksCallback; AUserData
  class. The file will be saved in UTF-8 encoding (in supported Delphi versions). Returns True on success. }
 function LogMemoryManagerStateToFile(const AFileName: string; const AAdditionalDetails: string = ''): Boolean;
 
+{-------------Memory Manager Object State Delta---------------}
+{ Helper functions to fetch allocated object lists and to create delta lists for runtime object allocation changes }
+
+const
+  MaxObjectDeltaNodes = 100000;
+  MaxClassInstances   = 100000;
+
+type
+  {State Objects for later delta calculations. The type is only needed for external state handling and type safety}
+  PMemoryManagerObjectState = Pointer;
+
+  PObjectDeltaNode = ^TObjectDeltaNode;
+  TObjectDeltaNode = record
+    {The class this node belongs to - can be used to fetch its name}
+    ClassPtr: Pointer;
+    {The delta of instances of the class}
+    InstanceDelta: NativeInt;
+    {Current count of instances}
+    InstanceCount: NativeInt;
+    {The total memory delta usage for this class}
+    TotalMemoryDelta: NativeInt;
+  end;
+
+  TObjectDeltaNodes = array[0..MaxObjectDeltaNodes- 1] of TObjectDeltaNode;
+  PObjectDeltaNodes = ^TObjectDeltaNodes;
+
+  PMemoryManagerObjectDelta = ^TMemoryManagerObjectDelta;
+  TMemoryManagerObjectDelta = record
+    {The changed amount of allocated bytes between two states.}
+    AllocatedBytesDelta: Int64;
+    {The changed amount of overhead bytes between two states.}
+    OverheadBytesDelta:  Int64;
+    {The number of object node deltas used.}
+    NodeCount: Integer;
+    Nodes: TObjectDeltaNodes;
+    AllocNumberLeft: Cardinal;
+    AllocNumberRight: Cardinal;
+  end;
+
+  PClassInstances = ^TClassInstances;
+  TClassInstances = array[0..MaxClassInstances- 1] of Pointer;
+
+  PClassInstanceData = ^TClassInstanceData;
+  TClassInstanceData = record
+    { Class Type }
+    ClassPtr: Pointer;
+    {Number of found class instances}
+    InstanceCount: NativeInt;
+    {Instance List}
+    Instances: TClassInstances;
+    {Min Allocation Number}
+    MinAllocationNumber: Cardinal;
+  end;
+
+  TBlockInfo = record
+    {The allocation number: All new allocations are numbered sequentially. This
+     number may be useful in memory leak analysis. If it reaches 4G it wraps
+     back to 0.}
+    AllocationNumber: Cardinal;
+    {The thread that allocated the block}
+    AllocatedByThread: Cardinal;
+    {The user requested size for the block. 0 if this is the first time the
+     block is used.}
+    UserSize: NativeUInt;
+  end;
+
+function Int64ToStrBuf(ANum: Int64; APBuffer: PAnsiChar; MinDigits: Integer = 0; IncludeSeperator: Boolean = False): PAnsiChar;
+
+{ Fetch the current Object State structure. Don't forget to free it after usage }
+function   GetMemoryManagerObjectState(): PMemoryManagerObjectState;
+{ Frees an object state structure, which was allocated through GetMemoryManagerObjectState }
+procedure  FreeMemoryManagerObjectState( const AObjectState: PMemoryManagerObjectState );
+
+{ }
+function   CalculateStateDelta( const ALeftState, ARightState: PMemoryManagerObjectState ): PMemoryManagerObjectDelta;
+procedure  FreeStateDeltaMemory( const AStateDeltaObject: PMemoryManagerObjectDelta );
+
+type TSortOperation = ( soNone, soAllocNumber, soAllocSize );
+
+function  GetClassInstances( const AClassPtr: Pointer; const AAllocationStart: Cardinal = 0; const ASortOperation: TSortOperation = soAllocNumber ): PClassInstanceData;
+procedure FreeClassInstances( const AClassInstanceData: PClassInstanceData );
+
+function  GetStackTraceStringFromMemory( const APointerArray: array of NativeUInt; const ACount: Cardinal): String;
+function  GetStackTraceStringFromBlock( const ABlockPtr: Pointer ): String;
+procedure GetStackTraceFromBlock( const ABlockPtr: Pointer; out OStackTracePtr: Pointer; out OStackTraceDepth: Integer );
+function  GetInfoFromBlock( const ABlockPtr: Pointer ): TBlockInfo;
+
+ {Writes a log file containing a summary of the memory manager state and a summary of allocated blocks grouped by
+ class. The file will be saved in UTF-8 encoding (in supported Delphi versions). Returns True on success. }
+function LogMemoryManagerStateDeltaToFile(const AFileName: string; const AStateDelta: PMemoryManagerObjectDelta; const AAdditionalDetails: string = ''): Boolean;
+
+
 {$ifdef UseReleaseStack}
 {$ifdef DebugReleaseStack}
 procedure LogReleaseStackUsage;
@@ -11194,6 +11286,618 @@ begin
   else
     Result := False;
 end;
+
+{ ----------------------- Memory Manager State Delta implementation --------------------- }
+type
+  PMemoryManagerObjectStateInfo = ^TMemoryManagerObjectStateInfo;
+  TMemoryManagerObjectStateInfo = record
+    { state usage summary }
+    Usage: TMemoryManagerUsageSummary;
+    { state memory log info }
+    LogInfo: TMemoryLogInfo;
+    { current Allocation Number - kind of like time stamp }
+    AllocationNumer: Cardinal;
+  end;
+
+{Converts an integer to string at the buffer location, returning the new buffer position.}
+function Int64ToStrBuf(ANum: Int64; APBuffer: PAnsiChar; MinDigits: Integer = 0; IncludeSeperator: Boolean = False): PAnsiChar;
+const
+  MaxDigits = 64;
+var
+  LDigitBuffer: array[0..MaxDigits - 1] of AnsiChar;
+  LCount: Cardinal;
+  LDigit: Int64;
+  LSign:  Boolean;
+begin
+  {Generate the digits in the local buffer}
+  LCount    := 0;
+  LSign     := ANum < 0; {look for negative sign '-'}
+  ANum      := Abs(ANum);
+  repeat
+    LDigit := ANum;
+    ANum := ANum div 10;
+    LDigit := LDigit - ANum * 10;
+    Inc(LCount);
+    //add . seperator, if needed x.xxx.xxx
+    if IncludeSeperator and ((LCount mod 4) = 0)then
+    begin
+      LDigitBuffer[MaxDigits - LCount] := AnsiChar('.');
+      Inc(LCount);
+    end;
+    LDigitBuffer[MaxDigits - LCount] := AnsiChar(Ord('0') + LDigit);
+  until ANum = 0;
+
+  {Check for negative sign}
+  if (LSign) then
+  begin
+    Inc(LCount);
+    LDigitBuffer[MaxDigits - LCount] := AnsiChar('-');
+  end;
+
+  {Ensure enough digits are used for output string}
+  while (MinDigits > LCount) do
+  begin
+    APBuffer^ := ' ';
+    Inc(APBuffer);
+    Dec(MinDigits);
+  end;
+
+  {Copy the digits to the output buffer and advance it}
+  System.Move(LDigitBuffer[MaxDigits - LCount], APBuffer^, LCount);
+  Result := APBuffer + LCount;
+end;
+
+{ uses parts of "LogMemoryManagerStateCallBack" logic to find the appropriate object node}
+procedure FindAndLogNodeDelta( const AState: PMemoryManagerObjectStateInfo; const AObjectNode: PMemoryLogNode; ADeltaNode: PObjectDeltaNode; var AFound: Boolean  );
+var
+  LClass, LClassHashBits: NativeUInt;
+  LPLogInfo: PMemoryLogInfo;
+  LPParentNode, LPClassNode: PMemoryLogNode;
+  LChildNodeDirection: Boolean;
+begin
+  LPLogInfo := @AState.LogInfo;
+  {Detecting an object is very expensive (due to the VirtualQuery call), so we do some basic checks and try to find
+   the "class" in the tree first.}
+  LClass := NativeInt(AObjectNode.ClassPtr);
+
+  {Do some basic pointer checks: The "class" must be dword aligned and beyond 64K}
+  {The class does exist, since it is present in the "compare from" object tree}
+  if (( LClass > 65535) and (LClass and 3 = 0)) or
+      ( LClass <= Ord( High( TStringDataType ))) then
+  begin
+    LPParentNode := @LPLogInfo.RootNode;
+    LClassHashBits := LClass;
+    repeat
+      LChildNodeDirection := Boolean(LClassHashBits and 1);
+      {Split off the next bit of the class pointer and traverse in the appropriate direction.}
+      LPClassNode := LPParentNode.LeftAndRightNodePointers[LChildNodeDirection];
+      {Is this child node the node the class we're looking for?}
+      if (LPClassNode = nil) or (NativeUInt(LPClassNode.ClassPtr) = LClass) then
+        Break;
+      {The node was not found: Keep on traversing the tree.}
+      LClassHashBits := LClassHashBits shr 1;
+      LPParentNode := LPClassNode;
+    until False;
+  end
+  else
+    LPClassNode := nil;
+
+  //the result class pointer is always the object nodes pointer
+  ADeltaNode.ClassPtr := AObjectNode.ClassPtr;
+
+  {Was the "class" found?}
+  AFound := (LPClassNode <> nil);
+
+  if AFound then
+  begin
+    //found - calc the diff
+    ADeltaNode.InstanceDelta    := AObjectNode.InstanceCount    - LPClassNode.InstanceCount;
+    ADeltaNode.InstanceCount    := AObjectNode.InstanceCount;
+    ADeltaNode.TotalMemoryDelta := AObjectNode.TotalMemoryUsage - LPClassNode.TotalMemoryUsage;
+  end
+  else
+  begin
+    //node does not exist in base tree - so the object is new: log all as delta
+    ADeltaNode.InstanceDelta    := AObjectNode.InstanceCount;
+    ADeltaNode.InstanceCount    := AObjectNode.InstanceCount;
+    ADeltaNode.TotalMemoryDelta := AObjectNode.TotalMemoryUsage;
+  end;
+end;
+
+{Reuse the allocation block traversal logic of "LogMemoryManagerStateToFile" }
+function GetMemoryManagerObjectState(): PMemoryManagerObjectState;
+var
+  LPStateInfo: PMemoryManagerObjectStateInfo;
+  //LMMUsageSummary: TMemoryManagerUsageSummary;
+begin
+
+  {Allocate the memory required to capture detailed allocation information.}
+  LPStateInfo := VirtualAlloc(nil, SizeOf(TMemoryManagerObjectStateInfo), MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE);
+  if LPStateInfo <> nil then
+  begin
+    {Get the current memory manager usage summary.}
+    GetMemoryManagerUsageSummary(LPStateInfo.Usage);
+
+    {Log all allocated blocks by class and create the logs binary search tree in one step.}
+    WalkAllocatedBlocks(LogMemoryManagerStateCallBack, @LPStateInfo.LogInfo);
+
+    //log the current allocation number
+{$ifdef FullDebugMode}
+    LPStateInfo.AllocationNumer := CurrentAllocationNumber;
+{$else}
+    LPStateInfo.AllocationNumer := 0;
+{$endif}
+
+    //return the state record as our special "external" type
+    Result := PMemoryManagerObjectState( Pointer ( LPStateInfo ) );
+  end
+  else
+    Result := nil;
+end;
+
+procedure QuickSort(const AClasses: PClassInstances; const LLow, LHigh: Integer; const ASortOperation: TSortOperation); overload;
+const
+  DebugHeaderSize = {$ifdef FullDebugMode}SizeOf(TFullDebugBlockHeader){$else}0{$endif};
+var
+  LPivot, LSwap: Pointer;
+  LLeft, LRight: Integer;
+
+  function Compare(const Index1, Index2: Integer): Boolean;
+  begin
+    case ASortOperation of
+      soAllocNumber:
+        Result := PFullDebugBlockHeader(PByte(AClasses[Index1]) - DebugHeaderSize).AllocationNumber >
+                  PFullDebugBlockHeader(PByte(AClasses[Index2]) - DebugHeaderSize).AllocationNumber;
+      soAllocSize:
+        Result := PFullDebugBlockHeader(PByte(AClasses[Index1]) - DebugHeaderSize).UserSize >
+                  PFullDebugBlockHeader(PByte(AClasses[Index2]) - DebugHeaderSize).UserSize;
+      else
+        Result := False;
+    end;
+  end;
+
+begin
+  {$ifdef FullDebugMode}
+  if (LLow < LHigh) then
+  begin
+    LPivot := AClasses[LLow];
+    LLeft := LLow;
+    LRight := LHigh;
+
+    while LLeft < LRight do
+    begin
+      while (LLeft < LHigh) and not Compare(LLeft, LLow) do
+        Inc(LLeft);
+      while (LRight > LLow) and Compare(LRight, LLow) do
+        Dec(LRight);
+
+      if LLeft < LRight then
+      begin
+        LSwap := AClasses[LLeft];
+        AClasses[LLeft] := AClasses[LRight];
+        AClasses[LRight] := LSwap;
+      end;
+    end;
+
+    AClasses[LLow] := AClasses[LRight];
+    AClasses[LRight] := LPivot;
+
+    QuickSort(AClasses, LLow, LRight - 1, ASortOperation);
+    QuickSort(AClasses, LRight + 1, LHigh, ASortOperation);
+  end;
+  {$endif}
+end;
+
+procedure Sort(const AClasses: PClassInstances; const LCount: Integer; const ASortOperation: TSortOperation); overload;
+begin
+  QuickSort(AClasses, 0, LCount - 1, ASortOperation);
+end;
+
+
+procedure QuickSort(const ANodes: PObjectDeltaNodes; const LLow, LHigh: Integer); overload;
+var
+  LPivot: TObjectDeltaNode;
+  LLeft, LRight: Integer;
+  LSwap: TObjectDeltaNode;
+begin
+  if (LLow < LHigh) then
+  begin
+    // Pivot-Element wird als erstes Element gewählt
+    LPivot := ANodes[LLow];
+    LLeft := LLow;
+    LRight := LHigh;
+
+    while LLeft < LRight do
+    begin
+      // Suche von links nach einem Element, das größer als das Pivot ist
+      while (LLeft <= LHigh) and (ANodes[LLeft].TotalMemoryDelta >= LPivot.TotalMemoryDelta) do
+        Inc(LLeft);
+
+      // Suche von rechts nach einem Element, das kleiner als das Pivot ist
+      while (LRight >= LLow) and (ANodes[LRight].TotalMemoryDelta < LPivot.TotalMemoryDelta) do
+        Dec(LRight);
+
+      // Wenn sich die Indizes noch nicht überschneiden, tausche die Elemente
+      if LLeft < LRight then
+      begin
+        LSwap := ANodes[LLeft];
+        ANodes[LLeft] := ANodes[LRight];
+        ANodes[LRight] := LSwap;
+      end;
+    end;
+
+    // Setze das Pivot-Element an die richtige Position
+    ANodes[LLow] := ANodes[LRight];
+    ANodes[LRight] := LPivot;
+
+    // Rekursiv die linke und rechte Partition sortieren
+    QuickSort(ANodes, LLow, LRight - 1);
+    QuickSort(ANodes, LRight + 1, LHigh);
+  end;
+end;
+
+procedure Sort(const ANodes: PObjectDeltaNodes; const LCount: Integer); overload;
+begin
+  QuickSort(ANodes, 0, LCount - 1);
+end;
+
+
+function CalculateStateDelta( const ALeftState, ARightState: PMemoryManagerObjectState ): PMemoryManagerObjectDelta;
+var
+  LNodeIdx:   Integer;
+  LLeft, LRight: PMemoryManagerObjectStateInfo;
+  LDelta: PMemoryManagerObjectDelta;
+  LNodeFound: Boolean;
+begin
+  Result := nil;
+  if not Assigned(ALeftState) or not Assigned(ARightState) then Exit;
+
+  { convert types }
+  LLeft := PMemoryManagerObjectStateInfo( Pointer( ALeftState ) );
+  LRight:= PMemoryManagerObjectStateInfo( Pointer( ARightState ) );
+
+  { allocate result structure }
+  LDelta := VirtualAlloc(nil, SizeOf(TMemoryManagerObjectDelta), MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE);
+  LDelta.NodeCount := 0;
+
+  LDelta.AllocNumberLeft  := LLeft.AllocationNumer;
+  LDelta.AllocNumberRight := LRight.AllocationNumer;
+
+  { calculate usage delta }
+  LDelta.AllocatedBytesDelta  := Int64(LRight.Usage.AllocatedBytes) - Int64(LLeft.Usage.AllocatedBytes);
+  LDelta.OverheadBytesDelta   := Int64(LRight.Usage.OverheadBytes)  - Int64(LLeft.Usage.OverheadBytes);
+
+  { Find all added or changed objects }
+  { Walk all right state objects and calculate the diff to the left state object }
+  for LNodeIdx := 0 to LRight.LogInfo.NodeCount-1 do
+  begin
+    //avoid a buffer overflow
+    if (LDelta.NodeCount >= MaxObjectDeltaNodes) then break;
+
+    //find the corresponding class in the left tree and calculate the output delta
+    FindAndLogNodeDelta( LLeft, @(LRight.LogInfo.Nodes[LNodeIdx]), @(LDelta.Nodes[LDelta.NodeCount]), LNodeFound );
+
+    //inc only, when we have a change
+    if ( LDelta.Nodes[LDelta.NodeCount].InstanceDelta <> 0) then
+      Inc( LDelta.NodeCount );
+  end;
+
+  { Find all missing objects }
+  { Walk all left state objects and calculate the diff to the right state object }
+  for LNodeIdx := 0 to LLeft.LogInfo.NodeCount-1 do
+  begin
+    //avoid a buffer overflow
+    if (LDelta.NodeCount >= MaxObjectDeltaNodes) then break;
+
+    //find the corresponding class in the left tree and calculate the output delta
+    FindAndLogNodeDelta( LRight, @(LLeft.LogInfo.Nodes[LNodeIdx]), @(LDelta.Nodes[LDelta.NodeCount]), LNodeFound );
+
+    //inc only, when the node was NOT found
+    if not LNodeFound then
+      Inc( LDelta.NodeCount );
+  end;
+
+  { Sort the result by size }
+  Sort( PObjectDeltaNodes(@(LDelta.Nodes)), LDelta.NodeCount );
+
+  Result := LDelta;
+end;
+
+
+procedure ListClassInstancesCallBack(APBlock: Pointer; ABlockSize: NativeInt; AUserData: Pointer);
+var
+  LData: PClassInstanceData;
+  LClass: NativeUInt;
+{$ifdef FullDebugMode}
+const
+  DebugHeaderSize = SizeOf(TFullDebugBlockHeader);
+{$endif}
+begin
+
+  LData := AUserData;
+
+  {Detecting an object is very expensive (due to the VirtualQuery call), so we do some basic checks and try to find
+   the "class" in the tree first.}
+  LClass := PNativeUInt(APBlock)^;
+
+  {ignore blocks, which are too old. Save the class detection overhead}
+{$ifdef FullDebugMode}
+  if ((PFullDebugBlockHeader(PByte(APBlock) - DebugHeaderSize).AllocationNumber) < LData.MinAllocationNumber) then
+    Exit();
+{$endif}
+
+  //if class type is a string type or unknown (< 3) and does not match, try to figure the type out
+  if (NativeUInt(LData.ClassPtr) < $3) and (NativeUInt(LData.ClassPtr) <> LClass) then
+  begin
+    {The "class" is not yet in the tree: Determine if it is actually a class.}
+    LClass := NativeUInt(DetectClassInstance(APBlock));
+    {If it is not a class, try to detect the string type.}
+    if LClass = 0 then
+      LClass := Ord(DetectStringData(APBlock, ABlockSize));
+  end;
+
+  //class found?
+  if (NativeUInt(LData.ClassPtr) = LClass) and (true) then
+  begin
+    LData.Instances[ LData.InstanceCount ] := APBlock;
+    LData.InstanceCount := LData.InstanceCount + 1;
+  end;
+end;
+
+function  GetClassInstances( const AClassPtr: Pointer; const AAllocationStart: Cardinal; const ASortOperation: TSortOperation ): PClassInstanceData;
+begin
+  Result := VirtualAlloc(nil, SizeOf(TClassInstanceData), MEM_COMMIT or MEM_TOP_DOWN, PAGE_READWRITE);
+
+  //prepare data
+  Result.ClassPtr             := AClassPtr;
+  Result.InstanceCount        := 0;
+  Result.MinAllocationNumber  := AAllocationStart;
+
+  {Walk all allocated blocks and find all class instances}
+  WalkAllocatedBlocks(ListClassInstancesCallBack, Result);
+
+  if (ASortOperation <> soNone) then
+    Sort(PClassInstances(@Result.Instances), Result.InstanceCount, ASortOperation);
+
+end;
+
+function  GetStackTraceStringFromMemory( const APointerArray: array of NativeUInt; const ACount: Cardinal): String;
+{$ifdef FullDebugMode}
+const
+  DebugHeaderSize = SizeOf(TFullDebugBlockHeader);
+var
+  LBuffer: array[0..16383] of AnsiChar;
+  LBufferPtr: PAnsiChar;
+begin
+  LBufferPtr := @LBuffer[0];
+  LBufferPtr := LogStackTrace(@(APointerArray), ACount, LBufferPtr);
+  Result := String( Copy( LBuffer, 0, (LBufferPtr-@LBuffer[0])) );
+end;
+{$else}
+begin
+ Result := 'Fastmm: no FullDebugMode = no StackTrace';
+end;
+{$endif}
+
+function GetStackTraceStringFromBlock( const ABlockPtr: Pointer ): String;
+{$ifdef FullDebugMode}
+const
+  DebugHeaderSize = SizeOf(TFullDebugBlockHeader);
+var
+  LBuffer: array[0..16383] of AnsiChar;
+  LBufferPtr: PAnsiChar;
+begin
+  LBufferPtr := @LBuffer[0];
+  LBufferPtr := LogStackTrace(@(PFullDebugBlockHeader(PByte(ABlockPtr) - DebugHeaderSize).AllocationStackTrace), StackTraceDepth, LBufferPtr);
+  Result := String( Copy( LBuffer, 0, (LBufferPtr-@LBuffer[0])) );
+end;
+{$else}
+begin
+ Result := 'Fastmm: no FullDebugMode = no StackTrace';
+end;
+{$endif}
+
+
+procedure GetStackTraceFromBlock( const ABlockPtr: Pointer; out OStackTracePtr: Pointer; out OStackTraceDepth: Integer );
+{$ifdef FullDebugMode}
+const
+  DebugHeaderSize = SizeOf(TFullDebugBlockHeader);
+begin
+  OStackTracePtr := @(PFullDebugBlockHeader(PByte(ABlockPtr) - DebugHeaderSize).AllocationStackTrace);
+  OStackTraceDepth := StackTraceDepth;
+end;
+{$else}
+begin
+  OStackTracePtr   := nil;
+  OStackTraceDepth := 0;
+end;
+{$endif}
+
+
+function GetInfoFromBlock( const ABlockPtr: Pointer ): TBlockInfo;
+{$ifdef FullDebugMode}
+var
+  LHeader: PFullDebugBlockHeader;
+begin
+  LHeader := PFullDebugBlockHeader(PByte(ABlockPtr) - SizeOf(TFullDebugBlockHeader));
+
+  Result.AllocationNumber   := LHeader.AllocationNumber;
+  Result.AllocatedByThread  := LHeader.AllocatedByThread;
+  Result.UserSize           := LHeader.UserSize;
+end;
+{$else}
+begin
+  Exit;
+end;
+{$endif}
+
+
+{Reuse the logic of "LogMemoryManagerStateToFile" }
+function LogMemoryManagerStateDeltaToFile(const AFileName: string; const AStateDelta: PMemoryManagerObjectDelta; const AAdditionalDetails: string = ''): Boolean;
+const
+  MsgBufferSize = 65536;
+  MaxLineLength = 512;
+  {Write the UTF-8 BOM in Delphi versions that support UTF-8 conversion.}
+  LogStateHeaderMsg = {$ifdef BCB6OrDelphi7AndUp}#$EF#$BB#$BF + {$endif} 'FastMM State Delta Capture:'#13#10'---------------------'#13#10#13#10;
+  LogStateAllocatedMsg = 'K Allocated'#13#10;
+  LogStateOverheadMsg = 'K Overhead'#13#10#13#10;
+  LogStateAdditionalInfoMsg = #13#10'Additional Information:'#13#10'-----------------------'#13#10;
+  LogStateAllocationSteps = 'Allocation call counter:'#13#10'-----------------------'#13#10;
+  LogStateAllocationStart = ' Start'#13#10;
+  LogStateAllocationEnd = ' End'#13#10;
+  LogStateAllocationDelta = ' Call Counts'#13#10;
+  LogStateDetailsMsg = #13#10'Allocation Details:'#13#10'-----------------------'#13#10;
+var
+  LInd: Integer;
+  LPNode: PObjectDeltaNode;
+  LMsgBuffer: array[0..MsgBufferSize - 1] of AnsiChar;
+  LPMsg: PAnsiChar;
+  LBufferSpaceUsed, LBytesWritten: Cardinal;
+  LFileHandle: NativeUInt;
+  LUTF8Str: AnsiString;
+begin
+
+  {$ifdef POSIX}
+  lFileHandle := FileCreate(AFilename);
+  {$else}
+  LFileHandle := CreateFile(PChar(AFilename), GENERIC_READ or GENERIC_WRITE, 0, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  {$endif}
+  if LFileHandle <> INVALID_HANDLE_VALUE then
+  begin
+    try
+      {Log the usage summary}
+      LPMsg := @LMsgBuffer;
+      LPMsg := AppendStringToBuffer(LogStateHeaderMsg, LPMsg, Length(LogStateHeaderMsg));
+      LPMsg := Int64ToStrBuf(AStateDelta.AllocatedBytesDelta div 1024, LPMsg, 16, True);
+      LPMsg := AppendStringToBuffer(LogStateAllocatedMsg, LPMsg, Length(LogStateAllocatedMsg));
+      LPMsg := Int64ToStrBuf(AStateDelta.OverheadBytesDelta div 1024, LPMsg, 16, True);
+      LPMsg := AppendStringToBuffer(LogStateOverheadMsg, LPMsg, Length(LogStateOverheadMsg));
+
+      {Log allocation step count}
+      LPMsg := AppendStringToBuffer(LogStateAllocationSteps, LPMsg, Length(LogStateAllocationSteps));
+      LPMsg := Int64ToStrBuf(AStateDelta.AllocNumberLeft, LPMsg, 16, True);
+      LPMsg := AppendStringToBuffer(LogStateAllocationStart, LPMsg, Length(LogStateAllocationStart));
+      LPMsg := Int64ToStrBuf(AStateDelta.AllocNumberRight, LPMsg, 16, True);
+      LPMsg := AppendStringToBuffer(LogStateAllocationEnd, LPMsg, Length(LogStateAllocationEnd));
+      LPMsg := Int64ToStrBuf(AStateDelta.AllocNumberRight-AStateDelta.AllocNumberLeft, LPMsg, 16, True);
+      LPMsg := AppendStringToBuffer(LogStateAllocationDelta, LPMsg, Length(LogStateAllocationDelta));
+      LPMsg := AppendStringToBuffer(LogStateDetailsMsg, LPMsg, Length(LogStateDetailsMsg));
+
+      {Log the allocation detail}
+      for LInd := 0 to AStateDelta.NodeCount - 1 do
+      begin
+        LPNode := @AStateDelta.Nodes[LInd];
+        {Add the allocated size}
+        LPMsg^ := ' ';
+        Inc(LPMsg);
+        LPMsg := Int64ToStrBuf(LPNode.TotalMemoryDelta, LPMsg, 16, True);
+        LPMsg := AppendStringToBuffer(BytesMessage, LPMsg, Length(BytesMessage));
+        {Add the class type}
+        case NativeInt(LPNode.ClassPtr) of
+          {Unknown}
+          0:
+          begin
+            LPMsg := AppendStringToBuffer(UnknownClassNameMsg, LPMsg, Length(UnknownClassNameMsg));
+          end;
+          {AnsiString}
+          1:
+          begin
+            LPMsg := AppendStringToBuffer(AnsiStringBlockMessage, LPMsg, Length(AnsiStringBlockMessage));
+          end;
+          {UnicodeString}
+          2:
+          begin
+            LPMsg := AppendStringToBuffer(UnicodeStringBlockMessage, LPMsg, Length(UnicodeStringBlockMessage));
+          end;
+          {Classes}
+        else
+          begin
+            LPMsg := AppendClassNameToBuffer(LPNode.ClassPtr, LPMsg);
+          end;
+        end;
+        {Add the count}
+        LPMsg^ := ' ';
+        Inc(LPMsg);
+        LPMsg^ := 'x';
+        Inc(LPMsg);
+        LPMsg^ := ' ';
+        Inc(LPMsg);
+        LPMsg := Int64ToStrBuf(LPNode.InstanceDelta, LPMsg, 0, True);
+        LPMsg^ := ' ';
+        Inc(LPMsg);
+        LPMsg^ := '(';
+        Inc(LPMsg);
+        LPMsg := Int64ToStrBuf(LPNode.InstanceCount, LPMsg, 0, True);
+        LPMsg^ := ')';
+        Inc(LPMsg);
+        LPMsg^ := #13;
+        Inc(LPMsg);
+        LPMsg^ := #10;
+        Inc(LPMsg);
+
+        {Flush the buffer?}
+        LBufferSpaceUsed := NativeInt(LPMsg) - NativeInt(@LMsgBuffer);
+        if LBufferSpaceUsed > (MsgBufferSize - MaxLineLength) then
+        begin
+          WriteFile(LFileHandle, LMsgBuffer, LBufferSpaceUsed, LBytesWritten, nil);
+          LPMsg := @LMsgBuffer;
+        end;
+      end;
+      if AAdditionalDetails <> '' then
+        LPMsg := AppendStringToBuffer(LogStateAdditionalInfoMsg, LPMsg, Length(LogStateAdditionalInfoMsg));
+      {Flush any remaining bytes}
+      LBufferSpaceUsed := NativeInt(LPMsg) - NativeInt(@LMsgBuffer);
+      if LBufferSpaceUsed > 0 then
+        WriteFile(LFileHandle, LMsgBuffer, LBufferSpaceUsed, LBytesWritten, nil);
+      {Write the additional info}
+      if AAdditionalDetails <> '' then
+      begin
+        {$ifdef BCB6OrDelphi7AndUp}
+        LUTF8Str := UTF8Encode(AAdditionalDetails);
+        {$else}
+        LUTF8Str := AAdditionalDetails;
+        {$endif}
+        WriteFile(LFileHandle, LUTF8Str[1], Length(LUTF8Str), LBytesWritten, nil);
+      end;
+      {Success}
+      Result := True;
+    finally
+      {Close the file}
+      {$ifdef POSIX}
+        {$ifndef fpc}
+      __close(LFileHandle)
+        {$else}
+      fpclose(LFileHandle)
+        {$endif}
+      {$else}
+      CloseHandle(LFileHandle);
+      {$endif}
+    end;
+  end;
+end;
+
+procedure FreeMemoryManagerObjectState( const AObjectState: PMemoryManagerObjectState );
+begin
+  if not Assigned(AObjectState) then Exit;
+
+  VirtualFree( Pointer(AObjectState), 0, MEM_RELEASE );
+end;
+
+procedure FreeStateDeltaMemory( const AStateDeltaObject: PMemoryManagerObjectDelta );
+begin
+  if not Assigned(AStateDeltaObject) then Exit;
+
+  VirtualFree( Pointer(AStateDeltaObject), 0, MEM_RELEASE );
+end;
+
+procedure FreeClassInstances( const AClassInstanceData: PClassInstanceData );
+begin
+  if not Assigned(AClassInstanceData) then Exit;
+
+  VirtualFree( Pointer(AClassInstanceData), 0, MEM_RELEASE );
+end;
+
+
 
 {-----------CheckBlocksOnShutdown implementation------------}
 
